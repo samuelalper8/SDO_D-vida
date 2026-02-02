@@ -2,85 +2,170 @@ import streamlit as st
 import pdfplumber
 import pandas as pd
 from io import BytesIO
+import re
 
-st.set_page_config(page_title="Extrator de Tabelas RFB", layout="wide", page_icon="🗃️")
+st.set_page_config(page_title="Extrator RFB (Bruto & Limpo)", layout="wide", page_icon="🗂️")
 
-def extrair_tabelas_exatas(pdf_file, nome_arquivo):
-    tabelas_encontradas = []
-    
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            # Extrai todas as tabelas da página
-            tables = page.extract_tables()
-            
-            for table in tables:
-                # table é uma lista de listas: [['Header1', 'Header2'], ['Val1', 'Val2']]
-                if not table: continue
-                
-                # Vamos converter para DataFrame para analisar
-                df_temp = pd.DataFrame(table)
-                
-                # Limpeza: Remove quebras de linha (\n) dentro das células que sujam o Excel
-                df_temp = df_temp.replace(r'\n', ' ', regex=True)
-                
-                # CRITÉRIO DE SEGURANÇA:
-                # Verificamos se é a tabela de débitos procurando palavras-chave do cabeçalho
-                # Convertemos a primeira linha para string para buscar as palavras
-                header_row = str(table[0]).upper()
-                
-                if "PROCESSO" in header_row or "MODALIDADE" in header_row or "SALDO DEVEDOR" in header_row:
-                    # Se achou, adiciona metadados (Arquivo/Página)
-                    df_temp.insert(0, "Arquivo Origem", nome_arquivo)
-                    tabelas_encontradas.append(df_temp)
-
-    return tabelas_encontradas
-
-# --- INTERFACE ---
-st.title("🗃️ Extrator de Tabelas Integrais (RFB)")
-st.markdown("Extrai a estrutura exata da tabela do PDF (todas as colunas: Modalidade, Sistema, Valor).")
-
-uploaded_files = st.file_uploader("Arraste os PDFs (Barro Alto, Pilar, etc)", type="pdf", accept_multiple_files=True)
-
-if uploaded_files:
+# --- 1. FUNÇÃO DE EXTRAÇÃO (Motor pdfplumber) ---
+def extrair_tabelas_brutas(uploaded_files):
     df_consolidado = pd.DataFrame()
     
-    with st.spinner("Mapeando grades das tabelas..."):
-        for f in uploaded_files:
-            # pdfplumber exige o arquivo, não apenas bytes. O Streamlit file buffer funciona.
-            tabelas = extrair_tabelas_exatas(f, f.name)
-            
-            for df_tabela in tabelas:
-                # Define a primeira linha como cabeçalho
-                novo_header = df_tabela.iloc[0]
-                df_tabela = df_tabela[1:] # Pega os dados da linha 1 em diante
-                df_tabela.columns = novo_header # Renomeia colunas
+    # Barra de progresso para visualização
+    progresso_texto = st.empty()
+    barra = st.progress(0)
+    
+    total_arquivos = len(uploaded_files)
+    
+    for i, pdf_file in enumerate(uploaded_files):
+        progresso_texto.text(f"Lendo arquivo {i+1}/{total_arquivos}: {pdf_file.name}")
+        
+        with pdfplumber.open(pdf_file) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables()
                 
-                # Adiciona coluna do nome do arquivo (que ficou sem nome após o header reset)
-                # O índice 0 do novo_header geralmente é 'Arquivo Origem' que inserimos, ou lixo.
-                # Vamos garantir que a coluna de arquivo exista
-                if "Arquivo Origem" not in df_tabela.columns:
-                     df_tabela["Arquivo Origem"] = f.name
-                
-                df_consolidado = pd.concat([df_consolidado, df_tabela], ignore_index=True)
+                for table in tables:
+                    if not table: continue
+                    
+                    df_temp = pd.DataFrame(table)
+                    
+                    # Verifica se é uma tabela válida de débitos (procura palavras-chave na 1ª linha)
+                    header_row = str(df_temp.iloc[0].values).upper()
+                    
+                    # Palavras-chave típicas da tabela RFB
+                    keywords = ["PROCESSO", "MODALIDADE", "SALDO DEVEDOR", "CNPJ VINCULADO"]
+                    if any(k in header_row for k in keywords):
+                        
+                        # Define a 1ª linha como cabeçalho
+                        df_temp.columns = df_temp.iloc[0]
+                        df_temp = df_temp[1:]
+                        
+                        # Adiciona coluna de origem
+                        df_temp["Arquivo Origem"] = pdf_file.name
+                        
+                        # Concatena
+                        df_consolidado = pd.concat([df_consolidado, df_temp], ignore_index=True)
+        
+        barra.progress((i + 1) / total_arquivos)
+    
+    progresso_texto.empty()
+    barra.empty()
+    
+    return df_consolidado
 
-    if not df_consolidado.empty:
-        st.success(f"✅ Extração completa! Tabelas recuperadas com sucesso.")
+# --- 2. FUNÇÃO DE LIMPEZA E ORGANIZAÇÃO ---
+def organizar_dados(df_bruto):
+    if df_bruto.empty:
+        return pd.DataFrame()
+
+    df = df_bruto.copy()
+
+    # A. Normalização de Nomes de Colunas (Remove espaços e quebras)
+    df.columns = [str(c).replace('\n', ' ').strip().upper() for c in df.columns]
+    
+    # B. Identificação das Colunas (Para lidar com variações)
+    col_map = {}
+    for col in df.columns:
+        if "PROCESSO" in col: col_map[col] = "Processo"
+        elif "CNPJ" in col: col_map[col] = "CNPJ"
+        elif "MODALIDADE" in col: col_map[col] = "Modalidade"
+        elif "SISTEMA" in col: col_map[col] = "Sistema"
+        elif "SALDO" in col: col_map[col] = "Valor Original"
+        elif "ARQUIVO" in col: col_map[col] = "Arquivo"
+
+    df = df.rename(columns=col_map)
+
+    # C. Filtragem de Lixo (Linhas repetidas de cabeçalho e Totais)
+    # Remove linhas onde o conteúdo da coluna CNPJ é igual ao título da coluna
+    if 'CNPJ' in df.columns:
+        df = df[~df['CNPJ'].astype(str).str.contains("CNPJ", case=False, na=False)]
+    
+    # Remove linhas de Totais (geralmente tem "TOTAL" em alguma coluna)
+    # Convertemos tudo para string e procuramos "TOTAL"
+    mask_total = df.astype(str).apply(lambda x: x.str.contains('TOTAL', case=False)).any(axis=1)
+    df = df[~mask_total]
+
+    # D. Limpeza de Texto (\n -> espaço)
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].astype(str).str.replace('\n', ' ').str.strip()
+
+    # E. Conversão Numérica (Brasil R$ -> Float)
+    if 'Valor Original' in df.columns:
+        # Remove pontos de milhar e troca vírgula por ponto
+        df['Valor Numérico'] = df['Valor Original'].apply(
+            lambda x: float(x.replace('.', '').replace(',', '.')) if re.match(r'[\d.,]+', x) else 0.0
+        )
+
+    # F. Extração Inteligente do Município (Baseado no nome do arquivo padrão "GO - CIDADE - ...")
+    # Tenta pegar o texto entre o primeiro e o segundo hífen
+    def extrair_municipio(nome_arq):
+        partes = nome_arq.split('-')
+        if len(partes) >= 2:
+            return partes[1].strip().upper()
+        return nome_arq # Fallback
+
+    if 'Arquivo' in df.columns:
+        df.insert(0, 'Município', df['Arquivo'].apply(extrair_municipio))
+
+    # G. Seleção e Ordem Final das Colunas
+    cols_desejadas = ['Município', 'CNPJ', 'Processo', 'Modalidade', 'Sistema', 'Valor Numérico', 'Valor Original', 'Arquivo']
+    cols_finais = [c for c in cols_desejadas if c in df.columns]
+    
+    return df[cols_finais]
+
+# --- 3. INTERFACE PRINCIPAL ---
+st.title("🗂️ Extrator e Organizador RFB")
+st.markdown("Extrai tabelas de PDFs, gera uma aba bruta (auditoria) e uma aba limpa (gestão).")
+
+uploaded_files = st.file_uploader("Arraste os PDFs aqui", type="pdf", accept_multiple_files=True)
+
+if uploaded_files:
+    # 1. Extração
+    df_bruto = extrair_tabelas_brutas(uploaded_files)
+    
+    if not df_bruto.empty:
+        # 2. Organização
+        df_limpo = organizar_dados(df_bruto)
         
-        # Mostra prévia
-        st.dataframe(df_consolidado, use_container_width=True)
+        st.success("Processamento concluído!")
         
-        # Botão Download
+        # 3. Visualização em Abas
+        tab1, tab2 = st.tabs(["📂 Dados Organizados (Limpo)", "🔍 Dados Originais (Bruto)"])
+        
+        with tab1:
+            st.dataframe(df_limpo, use_container_width=True)
+            if 'Valor Numérico' in df_limpo.columns:
+                total = df_limpo['Valor Numérico'].sum()
+                st.metric("Total Consolidado da Seleção", f"R$ {total:,.2f}")
+        
+        with tab2:
+            st.dataframe(df_bruto, use_container_width=True)
+            
+        # 4. Botão de Download (Excel Multi-Aba)
         output = BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df_consolidado.to_excel(writer, index=False, sheet_name='Tabelas_Completas')
+            # Aba Organizada
+            df_limpo.to_excel(writer, index=False, sheet_name='Organizado')
+            wb = writer.book
+            ws_org = writer.sheets['Organizado']
             
-            # Ajuste fino de colunas
-            worksheet = writer.sheets['Tabelas_Completas']
-            worksheet.set_column('A:A', 30) # Arquivo
-            worksheet.set_column('B:Z', 20) # Outras colunas
+            # Formatação Moeda
+            fmt_money = wb.add_format({'num_format': '#,##0.00'})
+            col_idx_valor = df_limpo.columns.get_loc("Valor Numérico")
+            ws_org.set_column(col_idx_valor, col_idx_valor, 18, fmt_money)
+            ws_org.set_column(0, 0, 25) # Largura Município
+            ws_org.set_column(2, 3, 20) # Largura Processo/Modalidade
+
+            # Aba Bruta
+            df_bruto.to_excel(writer, index=False, sheet_name='Bruto_Original')
             
         output.seek(0)
-        st.download_button("⬇️ Baixar Tabela Original (.xlsx)", output, "Tabelas_RFB_Exatas.xlsx")
         
+        st.download_button(
+            label="⬇️ Baixar Excel (Bruto + Limpo)",
+            data=output,
+            file_name="Relatorio_Dividas_RFB_Completo.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
     else:
-        st.warning("Nenhuma tabela padrão encontrada. Verifique se o PDF é imagem (scaneado) ou texto selecionável.")
+        st.warning("Nenhuma tabela encontrada. Verifique se os arquivos são PDFs pesquisáveis (não escaneados).")
