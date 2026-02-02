@@ -5,113 +5,157 @@ import re
 from io import BytesIO
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Extrator RFB Detalhado", layout="wide", page_icon="📊")
+st.set_page_config(page_title="Extrator Detalhado RFB", layout="wide", page_icon="📑")
 
-# --- FUNÇÃO DE EXTRAÇÃO (Lógica Aprimorada) ---
+# --- FUNÇÃO DE EXTRAÇÃO (Lógica Linha a Linha) ---
 def extrair_dados_pdf(pdf_bytes, nome_arquivo):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     texto_completo = ""
     for pagina in doc:
         texto_completo += pagina.get_text()
     
-    # 1. Regex para Município e CNPJ
+    # 1. Identificação do Município e CNPJ (Cabeçalho)
     municipio_match = re.search(r"MUNICIPIO DE\s+(.*)", texto_completo)
     municipio = municipio_match.group(1).strip().upper() if municipio_match else "DESCONHECIDO"
     
-    cnpj_match = re.search(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", texto_completo)
-    cnpj = cnpj_match.group(1) if cnpj_match else ""
+    # Busca o CNPJ padrão no cabeçalho
+    cnpj_header_match = re.search(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", texto_completo)
+    cnpj_header = cnpj_header_match.group(1) if cnpj_header_match else ""
 
-    # 2. Extração da Tabela (Linha a Linha)
     parcelamentos = []
+    
+    # Quebra o texto em linhas para analisar uma a uma
     linhas = [l.strip() for l in texto_completo.split('\n') if l.strip()]
     
+    # 2. Varredura da Tabela
+    # A lógica aqui é: Toda linha de parcelamento na RFB contém o CNPJ do devedor.
+    # Vamos caçar todas as ocorrências do CNPJ e extrair os dados ao redor.
+    
     for i, linha in enumerate(linhas):
-        # Verifica se o CNPJ aparece na linha (não precisa ser no início)
-        if cnpj and cnpj in linha:
-            # Tenta capturar o ID do Parcelamento/Processo (Sequência numérica longa, geralmente 9+ dígitos)
-            # Ignora o próprio CNPJ na busca de números longos
-            numeros_na_linha = re.findall(r"\d{9,}", linha)
+        # Verifica se o CNPJ (ou parte dele) está na linha
+        # Usamos apenas os números do CNPJ para evitar problemas com pontuação diferente
+        cnpj_limpo = cnpj_header.replace('.', '').replace('/', '').replace('-', '')
+        linha_limpa = linha.replace('.', '').replace('/', '').replace('-', '')
+        
+        # Se a linha contém o CNPJ e parece ser uma linha de dados (tem valor monetário)
+        if cnpj_header and (cnpj_header in linha) and re.search(r"\d+,\d{2}", linha):
             
-            # Remove números que pareçam ser parte do CNPJ (limpeza básica)
-            numeros_limpos = [n for n in numeros_na_linha if n not in cnpj.replace('.', '').replace('/', '').replace('-', '')]
+            # --- Extração do Processo/Negociação ---
+            # Removemos o CNPJ da linha para não confundir
+            linha_sem_cnpj = linha.replace(cnpj_header, "")
             
-            # O processo geralmente é o primeiro número longo encontrado após o CNPJ
-            processo = numeros_limpos[0] if numeros_limpos else "Não identificado"
+            # Buscamos sequências numéricas longas (Processos geralmente tem > 7 dígitos)
+            # Ex: 10120729679201251 ou 620240890
+            match_processos = re.findall(r"\b\d{7,}\b", linha_sem_cnpj)
+            
+            # O primeiro número longo que sobrar geralmente é o processo
+            processo = match_processos[0] if match_processos else "N/D"
 
-            # Tenta capturar o Valor (Formato R$ com vírgula: 1.000,00)
-            match_valor = re.search(r"(\d{1,3}(?:\.\d{3})*,\d{2})", linha)
+            # --- Extração do Valor ---
+            # Busca formato monetário brasileiro: X.XXX,XX ou apenas XXX,XX
+            match_valor = re.findall(r"(\d{1,3}(?:\.\d{3})*,\d{2})", linha)
             
-            if match_valor:
-                valor = match_valor.group(1)
-                
-                # ADICIONA O ITEM ENCONTRADO
-                parcelamentos.append({
-                    "Origem": "Linha Detalhada",
-                    "Processo": processo, 
-                    "Saldo": valor
-                })
-            else:
-                # Se achou o processo mas o valor quebrou para a linha de baixo
-                if i + 1 < len(linhas):
-                    prox_valor = re.search(r"(\d{1,3}(?:\.\d{3})*,\d{2})", linhas[i+1])
-                    if prox_valor:
-                        parcelamentos.append({
-                            "Origem": "Linha Detalhada (Quebra)",
-                            "Processo": processo, 
-                            "Saldo": prox_valor.group(1)
-                        })
+            # O valor do saldo devedor é geralmente o ÚLTIMO valor monetário da linha
+            valor = match_valor[-1] if match_valor else "0,00"
+            
+            # Identificação do Sistema (SIPADE / SICOB / PARCWEB) - Opcional, ajuda a validar
+            sistema = "Outros"
+            if "SIPADE" in linha: sistema = "SIPADE"
+            elif "SICOB" in linha or "PARCWEB" in linha: sistema = "PARCWEB/SICOB"
+            
+            parcelamentos.append({
+                "Processo/Negociação": processo,
+                "Sistema": sistema,
+                "Saldo": valor,
+                "Linha Original": linha # Debug se precisar conferir
+            })
 
-    # 3. Fallback: Se a lista estiver vazia, pega o Total Geral e o Número do Dossiê
+    # 3. Fallback (Caso de Amaralina ou tabelas vazias)
     if not parcelamentos:
         saldo_total = re.search(r"SALDO DEVEDOR TOTAL\s+([\d.,]+)", texto_completo)
         valor_total = saldo_total.group(1) if saldo_total else "0,00"
         
-        # Pega o número do processo principal (Dossiê) no cabeçalho
-        dossie_match = re.search(r"No Processo/Dossiê\s+([\d./-]+)", texto_completo)
-        proc_ref = dossie_match.group(1) if dossie_match else "Consolidado"
-        
-        parcelamentos.append({
-            "Origem": "Consolidado (Total)",
-            "Processo": proc_ref, 
-            "Saldo": valor_total
-        })
+        # Se o valor for 0,00, adiciona uma linha indicando que não há dívida
+        obs = "Sem parcelamentos listados"
+        if valor_total == "0,00":
+            parcelamentos.append({
+                "Processo/Negociação": "-",
+                "Sistema": "-",
+                "Saldo": "0,00",
+                "Linha Original": obs
+            })
+        else:
+            # Se tem saldo total mas não achou linhas, pega o processo do cabeçalho
+            proc_header = re.search(r"No Processo/Dossiê\s+([\d./-]+)", texto_completo)
+            proc_ref = proc_header.group(1) if proc_header else "Consolidado"
+            
+            parcelamentos.append({
+                "Processo/Negociação": proc_ref,
+                "Sistema": "Consolidado",
+                "Saldo": valor_total,
+                "Linha Original": "Extração pelo Total Geral"
+            })
 
-    return {"Arquivo": nome_arquivo, "Município": municipio, "CNPJ": cnpj, "Parcelamentos": parcelamentos}
+    return {
+        "Arquivo": nome_arquivo,
+        "Município": municipio, 
+        "CNPJ": cnpj_header, 
+        "Parcelamentos": parcelamentos
+    }
 
 # --- INTERFACE ---
-st.title("📊 Extrator de Parcelamentos - RFB")
-st.markdown("Extrai cada linha de negociação individualmente.")
+st.title("📊 Extrator Detalhado de Parcelamentos RFB")
+st.markdown("""
+Esta ferramenta extrai **cada linha** da tabela de parcelamentos individualmente.
+Se houver múltiplos processos para o mesmo município, cada um aparecerá em uma linha na planilha.
+""")
 
-uploaded_files = st.file_uploader("Arraste os PDFs aqui", type="pdf", accept_multiple_files=True)
+uploaded_files = st.file_uploader("Arraste seus PDFs aqui", type="pdf", accept_multiple_files=True)
 
 if uploaded_files:
-    lista_final = []
+    lista_para_excel = []
     
-    with st.spinner("Processando..."):
+    with st.spinner("Lendo cada linha dos arquivos..."):
         for f in uploaded_files:
             dados = extrair_dados_pdf(f.read(), f.name)
             
+            # "Explode" a lista de parcelamentos para criar várias linhas no Excel
             for p in dados['Parcelamentos']:
-                lista_final.append({
-                    "Arquivo": dados['Arquivo'],
+                lista_para_excel.append({
+                    "Arquivo Origem": dados['Arquivo'],
                     "Município": dados['Município'],
                     "CNPJ": dados['CNPJ'],
-                    "Tipo Extração": p['Origem'],
-                    "Processo/Negociação": p['Processo'],
+                    "Processo / Negociação": p['Processo/Negociação'],
+                    "Sistema": p['Sistema'],
                     "Saldo Devedor (R$)": p['Saldo']
                 })
     
-    if lista_final:
-        df = pd.DataFrame(lista_final)
-        st.success(f"✅ Processado! Foram encontradas {len(df)} linhas de débitos.")
+    if lista_para_excel:
+        df = pd.DataFrame(lista_para_excel)
+        
+        st.success(f"✅ Processamento Concluído! Extraídas {len(df)} linhas de débitos.")
         st.dataframe(df, use_container_width=True)
         
+        # Botão Excel
         output = BytesIO()
-        # Engine ajustada para xlsxwriter (lembre-se do requirements.txt)
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df.to_excel(writer, index=False, sheet_name='Saldos_Detalhados')
+            df.to_excel(writer, index=False, sheet_name='Analitico_Dividas')
+            
+            # Ajuste de largura das colunas (estética)
+            workbook = writer.book
+            worksheet = writer.sheets['Analitico_Dividas']
+            format_currency = workbook.add_format({'num_format': '#,##0.00'})
+            worksheet.set_column('F:F', 15, format_currency) # Coluna de valor
+            worksheet.set_column('B:B', 30) # Município
+            worksheet.set_column('D:D', 25) # Processo
             
         output.seek(0)
-        st.download_button("⬇️ Baixar Excel Detalhado", output, "Saldos_RFB_Detalhados.xlsx")
+        
+        st.download_button(
+            label="⬇️ Baixar Planilha Detalhada (.xlsx)",
+            data=output,
+            file_name="Relatorio_Detalhado_Parcelamentos.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
     else:
-        st.warning("Nenhum dado encontrado.")
+        st.warning("Nenhuma informação encontrada nos arquivos.")
