@@ -46,17 +46,18 @@ def extrair_tabelas_brutas(uploaded_files):
                 if not arquivo_teve_dados:
                     texto_pag1 = pdf.pages[0].extract_text() or ""
                     
-                    # Regex para capturar CNPJ (Município pegaremos do nome do arquivo na limpeza)
+                    # Regex para capturar CNPJ
                     cnpj_match = re.search(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", texto_pag1)
                     cnpj_num = cnpj_match.group(1) if cnpj_match else ""
 
+                    # AQUI ESTÁ O AJUSTE: "Nada Consta" preservado na Modalidade
                     df_resgate = pd.DataFrame([{
                         "Arquivo Origem": pdf_file.name,
                         "CNPJ VINCULADO": cnpj_num,
-                        "PROCESSO/ID PARCELAMENTO": "SEM PARCELAMENTO IDENTIFICADO",
-                        "MODALIDADE": "Nada Consta",
+                        "PROCESSO/ID PARCELAMENTO": "-",   # Mantém visual limpo
+                        "MODALIDADE": "Nada Consta",       # Texto explícito solicitado
                         "SISTEMA": "-",
-                        "SALDO DEVEDOR": "0,00"
+                        "SALDO DEVEDOR": "-"               # Valor zerado com traço
                     }])
                     
                     df_consolidado = pd.concat([df_consolidado, df_resgate], ignore_index=True)
@@ -115,7 +116,10 @@ def organizar_dados(df_bruto):
     if 'Valor Original' in df.columns:
         def converter_valor(x):
             try:
-                x_str = str(x).replace(' ', '').replace('.', '').replace(',', '.')
+                x_str = str(x).strip()
+                if x_str == "-": return 0.0
+                
+                x_str = x_str.replace(' ', '').replace('.', '').replace(',', '.')
                 if re.match(r'^-?\d+(\.\d+)?$', x_str):
                     return float(x_str)
                 return 0.0
@@ -124,13 +128,12 @@ def organizar_dados(df_bruto):
 
         df['Valor Numérico'] = df['Valor Original'].apply(converter_valor)
 
-    # G. Extração de Município (AJUSTADO PARA TITLE CASE)
+    # G. Extração de Município (Title Case)
     def extrair_municipio(row):
         nome_arq = str(row.get('Arquivo', ''))
         try:
             partes = nome_arq.split('-')
             if len(partes) >= 2:
-                # .title() deixa a primeira letra de cada palavra maiúscula (Barro Alto)
                 return partes[1].strip().title() 
             return nome_arq.title()
         except:
@@ -146,7 +149,7 @@ def organizar_dados(df_bruto):
 
 # --- 3. INTERFACE PRINCIPAL ---
 st.title("🗂️ Extrator RFB (Lista Completa)")
-st.markdown("Extrai parcelamentos. Se o município não tiver débitos, ele aparecerá na lista como 'Sem Parcelamento' (R$ 0,00).")
+st.markdown("Extrai parcelamentos. Municípios sem débito constarão como 'Nada Consta'.")
 
 uploaded_files = st.file_uploader("Arraste os PDFs aqui", type="pdf", accept_multiple_files=True)
 
@@ -177,11 +180,13 @@ if uploaded_files:
                 df_limpo.to_excel(writer, index=False, sheet_name='Refinado')
                 wb = writer.book
                 ws = writer.sheets['Refinado']
-                fmt_money = wb.add_format({'num_format': '#,##0.00'})
+                
+                # Formatação Contábil para Valor
+                fmt_contabil = wb.add_format({'num_format': '_(* #,##0.00_);_(* (#,##0.00);_(* "-"??_);_(@_)'})
                 
                 if "Valor Numérico" in df_limpo.columns:
                     idx_val = df_limpo.columns.get_loc("Valor Numérico")
-                    ws.set_column(idx_val, idx_val, 18, fmt_money)
+                    ws.set_column(idx_val, idx_val, 18, fmt_contabil)
                 
                 ws.set_column(0, 0, 25) # Município
                 ws.set_column(2, 3, 30) # Processo/Modalidade
