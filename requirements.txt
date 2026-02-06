@@ -1,4 +1,7 @@
 streamlit
 pandas
-pdfplumber
+pdf2image
+pytesseract
+pillow
 xlsxwriter
+pdfplumber
